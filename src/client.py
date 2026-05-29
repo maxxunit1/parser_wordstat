@@ -1,65 +1,47 @@
 """
-Тестовый клиент Yandex Wordstat API (Yandex Cloud Search API).
-Endpoint: POST https://searchapi.api.cloud.yandex.net/v2/wordstat/topRequests
-Auth:     Authorization: Api-Key <API_KEY>
-
-Важно: folderId НЕ передаём — API Key уже привязан к каталогу неявно.
-Передача folderId вызывает 403 Permission denied.
+Yandex Wordstat API — парсер по списку фраз.
+Читает input/phrases.txt (одна фраза = одна строка).
+Сохраняет результат в output/results.json.
 """
 
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
 
-# Фикс кодировки консоли на Windows
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
 
 ENDPOINT = "https://searchapi.api.cloud.yandex.net/v2/wordstat/topRequests"
+INPUT_FILE = Path(__file__).parent.parent / "input" / "phrases.txt"
 OUTPUT_DIR = Path(__file__).parent.parent / "output"
 
 
-def get_top_requests(api_key: str, phrase: str, num_phrases: int = 50) -> dict:
+def get_frequency(api_key: str, phrase: str) -> int | None:
+    """Возвращает totalCount для фразы или None при ошибке."""
     headers = {
         "Authorization": f"Api-Key {api_key}",
         "Content-Type": "application/json",
     }
-    body = {
-        "phrase": phrase,
-        "numPhrases": num_phrases,
-    }
-
-    print("=" * 60)
-    print("ЗАПРОС")
-    print("=" * 60)
-    print(f"Endpoint : {ENDPOINT}")
-    print(f"Method   : POST")
-    print("Headers  :")
-    for k, v in headers.items():
-        if k == "Authorization":
-            print(f"  {k}: {v[:15]}***{v[-4:]}")
-        else:
-            print(f"  {k}: {v}")
-    print(f"Body     : {json.dumps(body, ensure_ascii=False)}")
-    print()
-
-    response = requests.post(ENDPOINT, headers=headers, json=body, timeout=30)
-
-    print("=" * 60)
-    print("ОТВЕТ")
-    print("=" * 60)
-    print(f"Status   : {response.status_code} {response.reason}")
-    print("Headers  :")
-    for k, v in response.headers.items():
-        print(f"  {k}: {v}")
-    print()
-
-    response.raise_for_status()
-    return response.json()
+    try:
+        r = requests.post(
+            ENDPOINT,
+            headers=headers,
+            json={"phrase": phrase, "numPhrases": 1},
+            timeout=15,
+        )
+        r.raise_for_status()
+        return int(r.json().get("totalCount", 0))
+    except requests.HTTPError as e:
+        print(f"  [HTTP {e.response.status_code}] {phrase}")
+        return None
+    except requests.RequestException as e:
+        print(f"  [ERROR] {phrase}: {e}")
+        return None
 
 
 def main():
@@ -70,40 +52,37 @@ def main():
         print("Ошибка: YANDEX_API_KEY не задан в .env")
         sys.exit(1)
 
-    phrase = "ппр"
-    print(f"Фраза: «{phrase}»\n")
+    if not INPUT_FILE.exists():
+        print(f"Ошибка: файл не найден — {INPUT_FILE}")
+        sys.exit(1)
 
-    try:
-        data = get_top_requests(api_key, phrase, num_phrases=50)
-    except requests.HTTPError as e:
-        print(f"HTTP-ошибка: {e.response.status_code}")
-        print(f"Тело: {e.response.text}")
-        sys.exit(1)
-    except requests.RequestException as e:
-        print(f"Ошибка соединения: {e}")
-        sys.exit(1)
+    phrases = [
+        line.strip()
+        for line in INPUT_FILE.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+
+    print(f"Фраз для проверки: {len(phrases)}\n")
+
+    results = []
+    for i, phrase in enumerate(phrases, 1):
+        freq = get_frequency(api_key, phrase)
+        status = f"{freq:>8,}" if freq is not None else "  ОШИБКА"
+        print(f"  [{i:02}/{len(phrases)}] {status}  {phrase}")
+        results.append({"phrase": phrase, "freq": freq})
+        time.sleep(0.15)  # ~6 запросов/сек — в пределах лимита
 
     OUTPUT_DIR.mkdir(exist_ok=True)
-    output_file = OUTPUT_DIR / "response.json"
+    output_file = OUTPUT_DIR / "results.json"
     with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    print(f"Полный ответ сохранён: {output_file}\n")
+        json.dump(results, f, ensure_ascii=False, indent=2)
 
-    results = data.get("results", [])
-    associations = data.get("associations", [])
-    total = data.get("totalCount")
+    found = sum(1 for r in results if r["freq"])
+    zeros = sum(1 for r in results if r["freq"] == 0)
+    errors = sum(1 for r in results if r["freq"] is None)
 
-    print(f"Общая частотность «{phrase}»: {int(total):,}" if total else "")
-    print(f"Результатов: {len(results)}  |  Ассоциаций: {len(associations)}\n")
-
-    print("--- Топ-10 results (фразы содержащие ключ) ---")
-    for i, item in enumerate(results[:10], 1):
-        print(f"  {i:2}. {int(item.get('count', 0)):>8,}  {item.get('phrase')}")
-
-    if associations:
-        print("\n--- Топ-5 associations (похожие запросы) ---")
-        for i, item in enumerate(associations[:5], 1):
-            print(f"  {i:2}. {int(item.get('count', 0)):>8,}  {item.get('phrase')}")
+    print(f"\nГотово → {output_file}")
+    print(f"С частотностью: {found}  |  Нули: {zeros}  |  Ошибки: {errors}")
 
 
 if __name__ == "__main__":
